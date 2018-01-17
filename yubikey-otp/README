@@ -1,0 +1,5 @@
+# YubiKey OTP Authentication Script for OpenVPN
+
+This script uses YubiKey OTP and PAM to authenticate a user.
+
+https://www.sparklabs.com/support/kb/article/yubikey-otp-two-factor-authentication-with-openvpn-and-viscosity/
