@@ -1,0 +1,5 @@
+YubiKey U2F Authentication Script for OpenVPN
+
+This script uses YubiKey U2F and PAM to authenticate a user.
+
+https://www.sparklabs.com/support/kb/article/yubikey-u2f-two-factor-authentication-with-openvpn-and-viscosity/
