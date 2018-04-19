@@ -1,0 +1,7 @@
+YubiKey U2F & PAM Authentication Plugin for OpenVPN
+
+This plugin uses YubiKey U2F and PAM to authenticate a user.
+
+Knowledge Base guide coming soon @ https://sparklabs.com
+
+Plugin is awaiting PR acceptance for support, hopefully from OpenVPN 2.4.7 onwards
