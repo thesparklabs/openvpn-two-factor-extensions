@@ -22,8 +22,14 @@
  */
 
 /*
- * OpenVPN plugin module to do PAM authentication using a split
- * privilege model.
+ * Modififcations made by SparkLabs Pty Ltd
+*/
+
+/*
+ * OpenVPN plugin module to do PAM and U2F Two Factor Authentication
+ * using a split privilege model.
+ * Uses a supporting python script, auth-pam-u2f.py, for U2F functionality
+ * Module based on auth-path plugin sample included with OpenVPN
  */
 
 #include <security/pam_appl.h>

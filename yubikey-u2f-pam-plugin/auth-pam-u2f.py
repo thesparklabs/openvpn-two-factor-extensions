@@ -1,3 +1,21 @@
+#!/usr/bin/python
+# Copyright (C) 2018 SparkLabs Pty Ltd
+#
+# This file is part of OpenVPN U2F Server Support.
+#
+# OpenVPN U2F Server Support is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# OpenVPN U2F Server Support is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with OpenVPN U2F Server Support.  If not, see <http://www.gnu.org/licenses/>.
+
 import sys, os
 import json, zlib
 from base64 import b64decode, b64encode
