@@ -33,7 +33,7 @@ class OpenVPNOTPAuth:
 		self.clientID = clientID
 		self.secretKey = secretKey
 
-	def AuthUser(username, password):
+	def AuthUser(self, username, password):
 		# Extract the token from the encoded password
 		if password.startswith('SCRV1:'):
 			# Extract the actual password and token
