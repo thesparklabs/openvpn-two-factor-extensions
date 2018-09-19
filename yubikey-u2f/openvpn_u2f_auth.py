@@ -163,6 +163,7 @@ class OpenVPNU2FAuth:
 
             if not loginValid:
                 self.clientDeny(cid, kid, "PAM Auth failed")
+				return
 
             #Check if the user has a device already registered
             if self.userNeedsRegistration(username):
