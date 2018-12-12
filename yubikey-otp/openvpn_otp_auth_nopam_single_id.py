@@ -51,11 +51,9 @@ if __name__ == "__main__":
         password = os.environ['password']
 	yubicoClientId = 'CLIENT_ID'
 	yubicoSecretKey = 'SECRET_KEY'
-        keyId = 'YOUR_KEY_ID_FIRST_12_CHARACTERS_OF_YUBIKEY_OUTPUT'
-
-        logging.debug('token '+password)
+        yubicoKeyId = 'YOUR_KEY_ID_FIRST_12_CHARACTERS_OF_YUBIKEY_OUTPUT'
 	
-        authClient = OpenVPNOTPAuth(keyId, yubicoClientId, yubicoSecretKey)
+        authClient = OpenVPNOTPAuth(yubicoKeyId, yubicoClientId, yubicoSecretKey)
 	if authClient.AuthUser(password):
 		sys.exit(0)
 	sys.exit(1)
