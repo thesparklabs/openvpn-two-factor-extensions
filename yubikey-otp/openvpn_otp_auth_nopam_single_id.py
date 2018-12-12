@@ -21,9 +21,6 @@
 
 
 import sys, os, logging
-import pam
-from base64 import b64decode
-import cPickle as pickle
 from yubico_client import Yubico
 
 class OpenVPNOTPAuth:
