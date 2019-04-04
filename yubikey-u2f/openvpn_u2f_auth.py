@@ -144,6 +144,8 @@ class OpenVPNU2FAuth:
                         #Now Auth
                         reply = self.buildU2FAuth(username)
                         self.clientDeny(cid, kid, "U2F Reg Required", reply)
+                    else:
+                        self.clientDeny(cid, kid, "U2F Reg Failed")
                 else:
                     print "Finish U2F Auth for %s" % username
                     success = self.finishU2FAuth(username, json.dumps(response))
@@ -151,7 +153,8 @@ class OpenVPNU2FAuth:
                         print "User %s Authenticated" % username
                         #Let the user connect
                         self.clientAllow(cid, kid)
-
+                    else:				
+                        self.clientDeny(cid, kid, "U2F Auth Failed")
 
                 return #Past here is a standard auth attempt
 
@@ -175,7 +178,7 @@ class OpenVPNU2FAuth:
                 #Send an auth request
                 print "U2F Authentication required for %s" % username
                 reply = self.buildU2FAuth(username)
-                self.clientDeny(cid, kid, "U2F Reg Required", reply)
+                self.clientDeny(cid, kid, "U2F Auth Required", reply)
         except Exception as e:
             print "Failed to authUser"
             print e
