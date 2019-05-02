@@ -1,12 +1,13 @@
 PREFIX=/etc/openvpn
 CFLAGS += -DPREFIX='"$(PREFIX)"' -DUSE_PAM_DLOPEN=1
+LD_LIB_PATH += "-I."
 
 OBJS = auth-pam-u2f.o pamdl.o utils.o
 
 all: auth-pam-u2f.so
 
 auth-pam-u2f.o: auth-pam-u2f.c
-	$(CC) $(CFLAGS) -fPIC -c auth-pam-u2f.c utils.c pamdl.c pamdl.h
+	$(CC) $(CFLAGS) $(LD_LIB_PATH) -fPIC -c auth-pam-u2f.c utils.c pamdl.c pamdl.h
 
 auth-pam-u2f.so: auth-pam-u2f.o pamdl.o utils.o
 	$(CC) -fPIC -shared -o auth-pam-u2f.so $(OBJS)
