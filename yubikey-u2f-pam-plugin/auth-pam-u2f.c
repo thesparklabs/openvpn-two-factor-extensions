@@ -486,9 +486,9 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
                     if (recv_string(context->foreground_fd, client_reason, sizeof(client_reason)) != -1) {
                         return_list[0] = malloc(sizeof(struct openvpn_plugin_string_list));
                         return_list[0]->name = malloc(sizeof(char) * 128);
-                        snprintf(return_list[0]->name, 128, "client_reason");
+                        snprintf(return_list[0]->name, 128, "%s", "client_reason");
                         return_list[0]->value = malloc(sizeof(char) * 4096);
-                        snprintf(return_list[0]->value, 4096, client_reason);
+                        snprintf(return_list[0]->value, 4096, "%s", client_reason);
                         return_list[0]->next = NULL;
                     }
                 }
@@ -752,7 +752,7 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
      */
     if (!dlopen_pam(pam_so))
     {
-        fprintf(stderr, "AUTH-PAM: BACKGROUND: could not load PAM lib %s: %s\n", pam_so, dlerror());
+        fprintf(stderr, "AUTH-PAM: BACKGROUND: could not load PAM lib %s: %d\n", pam_so, dlerror());
         send_control(fd, RESPONSE_INIT_FAILED);
         goto done;
     }
@@ -927,7 +927,6 @@ u2f_auth_verify(char *username, char* password, char **client_reason)
     close(pipefd[1]);
     while ((br = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
         buffer[br - 1] = '\0';
-        printf(buffer);
     }
     wait( &status);
 
