@@ -1,4 +1,4 @@
-PREFIX=/etc/openvpn
+PREFIX=/usr/share/openvpn/pam-u2f
 CFLAGS += -DPREFIX='"$(PREFIX)"' -DUSE_PAM_DLOPEN=1
 LD_LIB_PATH += "-I."
 
