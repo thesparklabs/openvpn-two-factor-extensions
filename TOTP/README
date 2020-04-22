@@ -1,0 +1,5 @@
+# TOTP Authentication Script for OpenVPN
+
+This script uses TOTP and PAM to authenticate a user.
+
+https://sparklabs.com/support/kb/article/totp-two-factor-authentication-with-openvpn-and-viscosity/
