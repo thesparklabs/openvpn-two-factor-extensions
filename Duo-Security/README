@@ -1,0 +1,5 @@
+# Duo Security Authentication Script for OpenVPN
+
+This script uses Duo Security and PAM to authenticate a user.
+
+https://sparklabs.com/support/kb/article/duo-security-two-factor-authentication-with-openvpn-and-viscosity/
