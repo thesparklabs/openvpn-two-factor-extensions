@@ -54,8 +54,8 @@
 
 #include <openvpn-plugin.h>
 
-#define INTERPRETER "python"
-#define U2F_SCRIPT_PATH "./auth-pam-u2f.py"
+#define INTERPRETER "python3"
+#define U2F_SCRIPT_PATH "/usr/share/openvpn/pam-u2f/auth-pam-u2f.py"
 
 #define DEBUG(verb) ((verb) >= 4)
 

@@ -1,7 +1,13 @@
 YubiKey U2F & PAM Authentication Plugin for OpenVPN
 
+Requirements:
+- Python3
+- https://github.com/thesparklabs/u2fval
+- pip packages - python-u2flib-server pam flask flask-sqlalchemy cachelib u2fval-client
+
 This plugin uses YubiKey U2F and PAM to authenticate a user.
 
-Knowledge Base guide coming soon @ https://sparklabs.com
+Knowledge Base guide @ https://sparklabs.com/support/kb/article/yubikey-u2f-two-factor-authentication-with-openvpn-and-viscosity/
 
-Plugin is awaiting PR acceptance for support, hopefully from OpenVPN 2.4.7 onwards
+Plugin is awaiting PR acceptance for support, hopefully from OpenVPN 2.5 onwards
+Pre-modified OpenVPN available from SparkLabs PPA - https://launchpad.net/~sparklabs

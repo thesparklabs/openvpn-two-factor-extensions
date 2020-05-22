@@ -16,9 +16,14 @@
 # You should have received a copy of the GNU General Public License
 # along with OpenVPN U2F Server Support.  If not, see <http://www.gnu.org/licenses/>.
 
-import sys, os
+import sys, os, base64
 import json, zlib
-from base64 import b64decode, b64encode
+
+def base64encode(string: str):
+    return base64.b64encode(string.encode('utf-8')).decode('utf-8')
+
+def base64decode(string: str):
+    return base64.b64decode(string.encode('utf-8')).decode('utf-8')
 
 from u2fval_client.client import (
     Client,
@@ -40,7 +45,7 @@ class OpenVPNU2FAuthPlugin:
         password = os.environ.get('password')
 
         if username == None:
-            print "No username issued"
+            print("No username issued")
             exit(1)
 
         if password == None:
@@ -50,19 +55,19 @@ class OpenVPNU2FAuthPlugin:
                 reply = self.buildU2FRegistration(username)
                 if reply == None:
                     exit(1)
-                print reply
+                print(reply)
             else:
                 reply = self.buildU2FAuth(username)
                 if reply == None:
                     exit(1)
-                print reply
+                print(reply)
             exit(2)
 
         elif password.startswith('CRV1:'):
             #Finish
             passwordSplit = password.split('::')
             ident = passwordSplit[1]
-            token = b64decode(passwordSplit[2])
+            token = base64.b64decode(passwordSplit[2].encode('utf-8'))
             #check if our token data is compressed
             if token.startswith(b'\x1f\x8b'):
                 #Data is compressed, inflate
@@ -72,7 +77,7 @@ class OpenVPNU2FAuthPlugin:
                     pass #Try without decompressing                    
 
             #Check if register or auth
-            response = json.loads(str(token))
+            response = json.loads(str(token.decode('utf-8')))
             if "registrationData" in response:
                 #Adds required version field...
                 response["version"] = "U2F_V2"
@@ -82,7 +87,7 @@ class OpenVPNU2FAuthPlugin:
                     reply = self.buildU2FAuth(username)
                     if reply == None:
                         exit(1)
-                    print reply
+                    print(reply)
                     exit(2)
             else:
                 success = self.finishU2FAuth(username, json.dumps(response))
@@ -105,14 +110,14 @@ class OpenVPNU2FAuthPlugin:
             regreq["appId"] = data["appId"]
             regstr = json.dumps(regreq)
 
-            b64reg = b64encode(regstr)
-            b64user = b64encode(user)
+            b64reg = base64encode(regstr)
+            b64user = base64encode(user)
 
             reply = "CRV1:U2F,R:reg:%s:%s" % (b64user, b64reg)
             return reply
         except Exception as e:
-            print "Failed buildU2FRegistration"
-            print e
+            print("Failed buildU2FRegistration")
+            print(e)
         return None
 
     def finishU2FRegistration(self, user, reply):
@@ -122,8 +127,8 @@ class OpenVPNU2FAuthPlugin:
             if "created" in response:
                 return True
         except Exception as e:
-            print "Failed finishU2FRegistration"
-            print e
+            print("Failed finishU2FRegistration")
+            print(e)
         return False
 
     def buildU2FAuth(self, user):
@@ -139,13 +144,13 @@ class OpenVPNU2FAuthPlugin:
             response["keyHandle"] = keyhandle["keyHandle"]
             response["version"] = keyhandle["version"]
             authstr = json.dumps(response)
-            b64auth = b64encode(authstr)
-            b64user = b64encode(user)
+            b64auth = base64encode(authstr)
+            b64user = base64encode(user)
             reply = "CRV1:U2F:auth:%s:%s" % (b64user, b64auth)
             return reply
         except Exception as e:
-            print "Failed buildU2FAuth"
-            print e
+            print("Failed buildU2FAuth")
+            print(e)
         return None
 
     def finishU2FAuth(self, user, reply):
@@ -155,8 +160,8 @@ class OpenVPNU2FAuthPlugin:
             if "created" in response:
                 return True
         except Exception as e:
-            print "Failed finishU2FAuth"
-            print e
+            print("Failed finishU2FAuth")
+            print(e)
         return False
 
 if __name__ == '__main__':
