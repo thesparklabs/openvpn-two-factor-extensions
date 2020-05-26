@@ -119,13 +119,14 @@ struct user_pass {
     char username[128];
     char password[2048];
     char common_name[128];
+    char script_path[256];
 
     const struct name_value_list *name_value_list;
 };
 
 /* Background process function */
 static void pam_server(int fd, const char *service, int verb, const struct name_value_list *name_value_list);
-static int u2f_auth_verify(char *username, char* password, char **client_reason);
+static int u2f_auth_verify(char *username, char* password, char* script_path, char **client_reason);
 
 
 /*
@@ -461,13 +462,15 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
         const char *username = get_env("username", envp);
         const char *password = get_env("password", envp);
         const char *common_name = get_env("common_name", envp) ? get_env("common_name", envp) : "";
+        const char *script_path = get_env("u2f_script_path", envp) ? get_env("u2f_script_path", envp) : U2F_SCRIPT_PATH;
 
         if (username && strlen(username) > 0 && password)
         {
             if (send_control(context->foreground_fd, COMMAND_VERIFY) == -1
                 || send_string(context->foreground_fd, username) == -1
                 || send_string(context->foreground_fd, password) == -1
-                || send_string(context->foreground_fd, common_name) == -1)
+                || send_string(context->foreground_fd, common_name) == -1
+                || send_string(context->foreground_fd, script_path) == -1)
             {
                 fprintf(stderr, "AUTH-PAM: Error sending auth info to background process\n");
             }
@@ -789,7 +792,8 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
             case COMMAND_VERIFY:
                 if (recv_string(fd, up.username, sizeof(up.username)) == -1
                     || recv_string(fd, up.password, sizeof(up.password)) == -1
-                    || recv_string(fd, up.common_name, sizeof(up.common_name)) == -1)
+                    || recv_string(fd, up.common_name, sizeof(up.common_name)) == -1
+                    || recv_string(fd, up.script_path, sizeof(up.script_path)) == -1)
                 {
                     fprintf(stderr, "AUTH-PAM: BACKGROUND: read error on command channel: code=%d, exiting\n",
                             command);
@@ -803,13 +807,14 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                             up.username, up.password);
 #else
                     fprintf(stderr, "AUTH-PAM: BACKGROUND: USER: %s\n", up.username);
+                    fprintf(stderr, "AUTH-PAM: BACKGROUND: SCRIPT_PATH: %s\n\n", up.script_path);
 #endif
                 }
                 // If the password begins with CRV1 (there's better ways to detect this in case a users 
                 // password *actually* starts with CRV1::), validate it as U2F
                 if (!strncmp("CRV1::", up.password, 6)) {
                     char *client_reason;
-                    int u2f_resp = u2f_auth_verify(up.username, up.password, &client_reason);
+                    int u2f_resp = u2f_auth_verify(up.username, up.password, up.script_path, &client_reason);
                     if (u2f_resp == 0) {
                         if (send_control(fd, RESPONSE_VERIFY_SUCCEEDED) == -1)
                         {
@@ -836,7 +841,7 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                 {
                     // Validate via U2F now to get either a challenge or a registration response
                     char *client_reason;
-                    int u2f_resp = u2f_auth_verify(up.username, NULL, &client_reason);
+                    int u2f_resp = u2f_auth_verify(up.username, NULL, up.script_path, &client_reason);
                     if (u2f_resp == 2) {
                         if (send_control(fd, RESPONSE_VERIFY_FAILED_WITH_REASON) == -1)
                         {
@@ -897,7 +902,7 @@ done:
 /// 1 = Error
 /// 2 = Return client reason
 static int
-u2f_auth_verify(char *username, char* password, char **client_reason)
+u2f_auth_verify(char *username, char* password, char* script_path, char **client_reason)
 {
     int retval = 0;
     int pipefd[2];
@@ -906,7 +911,7 @@ u2f_auth_verify(char *username, char* password, char **client_reason)
     int pid;
     char cReason[4096];
 
-	char *argv[] = { INTERPRETER, U2F_SCRIPT_PATH, NULL };
+	char *argv[] = { INTERPRETER, script_path, NULL };
     pipe(pipefd);
 
     pid = fork();
