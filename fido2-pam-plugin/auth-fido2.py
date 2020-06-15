@@ -30,12 +30,43 @@ from fido2.webauthn import PublicKeyCredentialRpEntity
 from fido2.client import ClientData
 from fido2.server import Fido2Server
 from fido2.ctap2 import AttestationObject, AuthenticatorData
+from fido2.rpid import suffixes
 from fido2 import cbor
+import six
+from six.moves.urllib.parse import urlparse
+
+# Based on https://github.com/Yubico/python-fido2/blob/master/fido2/rpid.py
+def verify_rp_id_openvpn(rp_id, origin):
+    """Checks if a Webauthn RP ID is usable for a given origin.
+    :param rp_id: The RP ID to validate.
+    :param origin: The origin of the request.
+    :return: True if the RP ID is usable by the origin, False if not.
+    """
+    if isinstance(rp_id, six.binary_type):
+        rp_id = rp_id.decode()
+    if not rp_id:
+        return False
+    if isinstance(origin, six.binary_type):
+        origin = origin.decode()
+
+    url = urlparse(origin)
+    if url.scheme != "openvpn":
+        return False
+    host = url.hostname
+    if host == rp_id:
+        return True
+    if host.endswith("." + rp_id) and rp_id not in suffixes:
+        return True
+    return False
+
+def verify_origin_for_rp_openvpn(rp_id):
+    return lambda o: verify_rp_id_openvpn(rp_id, o)
+
 
 class OpenVPNFIDO2AuthPlugin:
     def __init__(self, fido2Origin, fido2Name):
         rp = PublicKeyCredentialRpEntity(fido2Origin, fido2Name)
-        self.server = Fido2Server(rp)
+        self.server = Fido2Server(rp, verify_origin=verify_origin_for_rp_openvpn)
         self.credentials = {}
         self.credsfile = 'creds.pickle'
         self.loadCredentials(self.credsfile)
@@ -121,8 +152,8 @@ class OpenVPNFIDO2AuthPlugin:
                 {
                     "id": user.encode('utf-8'), #Required
                     "name": user, # Optional
-                    "displayName": "Potato Man", #Optional
-                    "icon": "https://sparklabs.com/static/img/sl_appround_viscosity2.png" #Optional
+                    #"displayName": "First Last", #Optional
+                    #"icon": "https://domain.com/user_avatar.png" #Optional
                 },
                 self.credentials[user]["credentials"],
                 # User Verification Mode
