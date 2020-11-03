@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # Copyright (C) 2018 SparkLabs Pty Ltd
 #
 # This file is part of OpenVPN U2F Server Support.
@@ -54,7 +54,7 @@ class OpenVPNU2FAuth:
     def Connect(self):
         try:
             self.conn.open('127.0.0.1', self.port)
-            print "Connected"
+            print("Connected")
 
             while True:
                 try:
@@ -69,8 +69,8 @@ class OpenVPNU2FAuth:
                 self.processCommand(line)            
 
         except Exception as e:
-            print "Connection to OpenVPN failed."
-            print e
+            print("Connection to OpenVPN failed.")
+            print(e)
 
     def processCommand(self, line):
         split = line.split(':', 1)
@@ -136,7 +136,7 @@ class OpenVPNU2FAuth:
                 #Check if register or auth
                 response = json.loads(str(token))
                 if "registrationData" in response:
-                    print "Finish U2F Registration for %s" % username
+                    print("Finish U2F Registration for %s" % username)
                     #Adds required version field...
                     response["version"] = "U2F_V2"
                     success = self.finishU2FRegistration(username, json.dumps(response))
@@ -147,10 +147,10 @@ class OpenVPNU2FAuth:
                     else:
                         self.clientDeny(cid, kid, "U2F Reg Failed")
                 else:
-                    print "Finish U2F Auth for %s" % username
+                    print("Finish U2F Auth for %s" % username)
                     success = self.finishU2FAuth(username, json.dumps(response))
                     if success:
-                        print "User %s Authenticated" % username
+                        print("User %s Authenticated" % username)
                         #Let the user connect
                         self.clientAllow(cid, kid)
                     else:				
@@ -160,7 +160,8 @@ class OpenVPNU2FAuth:
 
             #PAM authenticate
             try:
-                loginValid = pam.authenticate(username, password)
+                p = pam.pam()
+                loginValid = p.authenticate(username, password)
             except:
                 loginValid = False
 
@@ -171,17 +172,17 @@ class OpenVPNU2FAuth:
             #Check if the user has a device already registered
             if self.userNeedsRegistration(username):
                 #Send a registration request
-                print "U2F Registration required for %s" % username
+                print("U2F Registration required for %s" % username)
                 reply = self.buildU2FRegistration(username)
                 self.clientDeny(cid, kid, "U2F Reg Required", reply)
             else:
                 #Send an auth request
-                print "U2F Authentication required for %s" % username
+                print("U2F Authentication required for %s" % username)
                 reply = self.buildU2FAuth(username)
                 self.clientDeny(cid, kid, "U2F Auth Required", reply)
         except Exception as e:
-            print "Failed to authUser"
-            print e
+            print("Failed to authUser")
+            print(e)
             #Reject the user
             self.clientDeny(cid, kid, "Failed authUser")
 
@@ -215,8 +216,8 @@ class OpenVPNU2FAuth:
             reply = "CRV1:U2F,R:reg:%s:%s" % (b64user, b64reg)
             return reply
         except Exception as e:
-            print "Failed buildU2FRegistration"
-            print e
+            print("Failed buildU2FRegistration")
+            print(e)
         return "U2F Registration Failed"
 
     def finishU2FRegistration(self, user, reply):
@@ -226,8 +227,8 @@ class OpenVPNU2FAuth:
             if "created" in response:
                 return True
         except Exception as e:
-            print "Failed finishU2FRegistration"
-            print e
+            print("Failed finishU2FRegistration")
+            print(e)
         return False
 
     def buildU2FAuth(self, user):
@@ -248,8 +249,8 @@ class OpenVPNU2FAuth:
             reply = "CRV1:U2F:auth:%s:%s" % (b64user, b64auth)
             return reply
         except Exception as e:
-            print "Failed buildU2FAuth"
-            print e
+            print("Failed buildU2FAuth")
+            print(e)
         return "U2F Auth Failed"
 
     def finishU2FAuth(self, user, reply):
@@ -259,18 +260,18 @@ class OpenVPNU2FAuth:
             if "created" in response:
                 return True
         except Exception as e:
-            print "Failed finishU2FAuth"
-            print e
+            print("Failed finishU2FAuth")
+            print(e)
         return False
 
 if __name__ == "__main__":
     # Find port number defined
     if not "--port" in sys.argv:
-        print "Missing --port command"
+        print("Missing --port command")
         exit(1)
     portCommand = sys.argv.index("--port")
     if len(sys.argv) - 2 < portCommand:
-        print "Need port number following --port"
+        print("Need port number following --port")
         exit(1)
     port = int(sys.argv[portCommand + 1])
 
