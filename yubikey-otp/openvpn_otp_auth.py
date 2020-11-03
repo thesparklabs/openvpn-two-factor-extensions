@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # Copyright (C) 2018 SparkLabs Pty Ltd
 #
 # This file is part of OpenVPN OTP Server Support.
@@ -20,10 +20,9 @@
 # https://www.sparklabs.com/support/kb/article/yubikey-otp-two-factor-authentication-with-openvpn-and-viscosity/
 
 
-import sys, os, logging
+import sys, os, logging, pickle
 import pam
 from base64 import b64decode
-import cPickle as pickle
 from yubico_client import Yubico
 
 class OpenVPNOTPAuth:
@@ -38,15 +37,16 @@ class OpenVPNOTPAuth:
 		if password.startswith('SCRV1:'):
 			# Extract the actual password and token
 			passwordSplit = password.split(':')
-			password = b64decode(passwordSplit[1])
-			token = b64decode(passwordSplit[2])
+			password = b64decode(passwordSplit[1]).decode('utf-8')
+			token = b64decode(passwordSplit[2]).decode('utf-8')
 		else:
 			# Invalid data
 			return False
 
 		# Check username and password are valid using PAM
 		try:
-			loginValid = pam.authenticate(username, password)
+			p = pam.pam()
+			loginValid = p.authenticate(username, password)
 		except:
 			loginValid = False
 
@@ -101,8 +101,8 @@ if __name__ == "__main__":
 	username = os.environ['username']
 	password = os.environ['password']
 	dbPath = '/etc/openvpn/token_index.db'
-	yubicoClientId = 'YOURCLIENTID'
-	yubicoSecretKey = 'YOURSECRETKEY'
+	yubicoClientId = os.environ['yubicoClientId']
+	yubicoSecretKey = os.environ['yubicoSecretKey']
 
 	authClient = OpenVPNOTPAuth(dbPath, yubicoClientId, yubicoSecretKey)
 	if authClient.AuthUser(username, password):
