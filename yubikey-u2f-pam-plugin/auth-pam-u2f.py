@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # Copyright (C) 2018 SparkLabs Pty Ltd
 #
 # This file is part of OpenVPN U2F Server Support.

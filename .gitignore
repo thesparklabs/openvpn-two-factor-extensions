@@ -2,3 +2,4 @@ yubikey-u2f-pam-plugin/.vscode/*
 *.o
 *.so
 *.gch
+.vs/

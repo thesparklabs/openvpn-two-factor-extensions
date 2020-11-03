@@ -44,6 +44,7 @@ class OpenVPNPYOTPAuth:
 
 		# Check username and password are valid using PAM
 		try:
+			p = pam.pam()
 			loginValid = pam.authenticate(username, password)
 		except:
 			loginValid = False

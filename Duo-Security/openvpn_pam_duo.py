@@ -48,7 +48,8 @@ class OpenVPNDuoAuth:
 
 		# Check username and password are valid using PAM
 		try:
-			loginValid = pam.authenticate(username, password)
+			p = pam.pam()
+			loginValid = p.authenticate(username, password)
 		except:
 			loginValid = False
 
