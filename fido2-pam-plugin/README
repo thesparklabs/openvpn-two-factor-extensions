@@ -6,7 +6,7 @@ Requirements:
 
 This plugin uses YubiKey FIDO2 and PAM to authenticate a user.
 
-Knowledge Base guide @ https://sparklabs.com/support/kb/article/fido2-two-factor-authentication-with-openvpn-and-viscosity/
-
 Plugin is awaiting PR acceptance for support, hopefully from OpenVPN 2.5 onwards
 Pre-modified OpenVPN available from SparkLabs PPA - https://launchpad.net/~sparklabs
+
+Viscosity does not yet support FIDO2. Support will be added when OpenVPN 2.5 is adopted.
