@@ -756,7 +756,7 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
      */
     if (!dlopen_pam(pam_so))
     {
-        fprintf(stderr, "AUTH-PAM: BACKGROUND: could not load PAM lib %s: %d\n", pam_so, dlerror());
+        fprintf(stderr, "AUTH-PAM: BACKGROUND: could not load PAM lib %s: %s\n", pam_so, dlerror());
         send_control(fd, RESPONSE_INIT_FAILED);
         goto done;
     }
