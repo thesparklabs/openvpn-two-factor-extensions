@@ -50,6 +50,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <syslog.h>
+#include <dlfcn.h>
 #include "utils.h"
 
 #include <openvpn-plugin.h>
