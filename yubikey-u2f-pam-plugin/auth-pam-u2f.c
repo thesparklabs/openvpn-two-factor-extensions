@@ -127,7 +127,7 @@ struct user_pass {
 
 /* Background process function */
 static void pam_server(int fd, const char *service, int verb, const struct name_value_list *name_value_list);
-static int u2f_auth_verify(char *username, char* password, char* script_path, char **client_reason);
+static int u2f_auth_verify(char *username, char* password, char* script_path, char *client_reason);
 
 
 /*
@@ -814,8 +814,8 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                 // If the password begins with CRV1 (there's better ways to detect this in case a users 
                 // password *actually* starts with CRV1::), validate it as U2F
                 if (!strncmp("CRV1::", up.password, 6)) {
-                    char *client_reason;
-                    int u2f_resp = u2f_auth_verify(up.username, up.password, up.script_path, &client_reason);
+                    char client_reason[4096];
+                    int u2f_resp = u2f_auth_verify(up.username, up.password, up.script_path, client_reason);
                     if (u2f_resp == 0) {
                         if (send_control(fd, RESPONSE_VERIFY_SUCCEEDED) == -1)
                         {
@@ -841,8 +841,8 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                 if (pam_auth(service, &up)) /* Succeeded */
                 {
                     // Validate via U2F now to get either a challenge or a registration response
-                    char *client_reason;
-                    int u2f_resp = u2f_auth_verify(up.username, NULL, up.script_path, &client_reason);
+                    char client_reason[4096];
+                    int u2f_resp = u2f_auth_verify(up.username, NULL, up.script_path, client_reason);
                     if (u2f_resp == 2) {
                         if (send_control(fd, RESPONSE_VERIFY_FAILED_WITH_REASON) == -1)
                         {
@@ -903,14 +903,13 @@ done:
 /// 1 = Error
 /// 2 = Return client reason
 static int
-u2f_auth_verify(char *username, char* password, char* script_path, char **client_reason)
+u2f_auth_verify(char *username, char* password, char* script_path, char *client_reason)
 {
     int retval = 0;
     int pipefd[2];
     char buffer[4096];
     int status, br;
     int pid;
-    char cReason[4096];
 
 	char *argv[] = { INTERPRETER, script_path, NULL };
     pipe(pipefd);
@@ -940,7 +939,7 @@ u2f_auth_verify(char *username, char* password, char* script_path, char **client
     if (WIFEXITED(status)) {
         if (client_reason != NULL && WEXITSTATUS(status) == 2) {
             fprintf(stderr, "AUTH-PAM: BACKGROUND: Got client reason %s\n", buffer);
-            *client_reason = &buffer;
+            memcpy(client_reason, buffer, sizeof(buffer));
             fprintf(stderr, "AUTH-PAM: BACKGROUND: Set client reason\n");
         }
         return WEXITSTATUS(status);
