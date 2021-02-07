@@ -934,6 +934,7 @@ u2f_auth_verify(char *username, char* password, char* script_path, char **client
         buffer[br - 1] = '\0';
     }
     wait( &status);
+    close(pipefd[0]);
 
     if (WIFEXITED(status)) {
         if (client_reason != NULL && WEXITSTATUS(status) == 2) {
