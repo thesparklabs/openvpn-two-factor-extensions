@@ -51,6 +51,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <syslog.h>
+#include <dlfcn.h>
 #include "utils.h"
 
 #include <openvpn-plugin.h>
@@ -129,7 +130,7 @@ struct user_pass {
 
 /* Background process function */
 static void pam_server(int fd, const char *service, int verb, const struct name_value_list *name_value_list);
-static int fido2_auth_verify(const struct user_pass *up, bool hasChallengeResponse, char **client_reason);
+static int fido2_auth_verify(const struct user_pass *up, bool hasChallengeResponse, char *client_reason);
 
 
 /*
@@ -762,7 +763,7 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
      */
     if (!dlopen_pam(pam_so))
     {
-        fprintf(stderr, "AUTH-PAM: BACKGROUND: could not load PAM lib %s: %d\n", pam_so, dlerror());
+        fprintf(stderr, "AUTH-PAM: BACKGROUND: could not load PAM lib %s: %s\n", pam_so, dlerror());
         send_control(fd, RESPONSE_INIT_FAILED);
         goto done;
     }
@@ -822,8 +823,8 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                 // If the password begins with CRV1 (there's better ways to detect this in case a users 
                 // password *actually* starts with CRV1::), validate it as fido2
                 if (!strncmp("CRV1::", up.password, 6)) {
-                    char *client_reason;
-                    int fido2_resp = fido2_auth_verify(&up, true, &client_reason);
+                    char client_reason[4096];
+                    int fido2_resp = fido2_auth_verify(&up, true, client_reason);
                     if (fido2_resp == 0) {
                         if (send_control(fd, RESPONSE_VERIFY_SUCCEEDED) == -1)
                         {
@@ -849,8 +850,8 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                 if (pam_auth(service, &up)) /* Succeeded */
                 {
                     // Validate via FIDO2 now to get either a challenge or a registration response
-                    char *client_reason;
-                    int fido2_resp = fido2_auth_verify(&up, false, &client_reason);
+                    char client_reason[4096];
+                    int fido2_resp = fido2_auth_verify(&up, false, client_reason);
                     if (fido2_resp == 2) {
                         if (send_control(fd, RESPONSE_VERIFY_FAILED_WITH_REASON) == -1)
                         {
@@ -911,14 +912,13 @@ done:
 /// 1 = Error
 /// 2 = Return client reason
 static int
-fido2_auth_verify(const struct user_pass *up, bool hasChallengeResponse, char **client_reason)
+fido2_auth_verify(const struct user_pass *up, bool hasChallengeResponse, char *client_reason)
 {
     int retval = 0;
     int pipefd[2];
     char buffer[4096];
     int status, br;
     int pid;
-    char cReason[4096];
 
 	char *argv[] = { INTERPRETER, up->script_path, NULL };
     pipe(pipefd);
@@ -945,11 +945,12 @@ fido2_auth_verify(const struct user_pass *up, bool hasChallengeResponse, char **
         buffer[br - 1] = '\0';
     }
     wait( &status);
+    close(pipefd[0]);
 
     if (WIFEXITED(status)) {
         if (client_reason != NULL && WEXITSTATUS(status) == 2) {
             fprintf(stderr, "AUTH-PAM: BACKGROUND: Got client reason %s\n", buffer);
-            *client_reason = &buffer;
+            memcpy(client_reason, buffer, sizeof(buffer));
             fprintf(stderr, "AUTH-PAM: BACKGROUND: Set client reason\n");
         }
         return WEXITSTATUS(status);
