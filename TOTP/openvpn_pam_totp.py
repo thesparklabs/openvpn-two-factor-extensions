@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 # Copyright (C) 2018 SparkLabs Pty Ltd
 #
 # This file is part of OpenVPN OTP Server Support.
