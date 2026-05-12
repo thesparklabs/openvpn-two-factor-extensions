@@ -5,7 +5,8 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2002-2026 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2016-2026 Selva Nair <selva.nair@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -17,20 +18,18 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ *  with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
 /*
- * Modififcations made by SparkLabs Pty Ltd
-*/
-
-/*
- * OpenVPN plugin module to do PAM and U2F Two Factor Authentication
+ * OpenVPN plugin module to do PAM and U2F two-factor authentication
  * using a split privilege model.
- * Uses a supporting python script, auth-pam-u2f.py, for U2F functionality
- * Module based on auth-path plugin sample included with OpenVPN
+ *
+ * Modifications made by SparkLabs Pty Ltd.
  */
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
 
 #include <security/pam_appl.h>
 
@@ -38,27 +37,34 @@
 #include "pamdl.h"
 #endif
 
-#include <sys/stat.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <syslog.h>
+#include <limits.h>
+#include <errno.h>
+#include <poll.h>
+#include <stdint.h>
+#include <time.h>
 #include <dlfcn.h>
 #include "utils.h"
-
+#include <arpa/inet.h>
 #include <openvpn-plugin.h>
+
+#define DEBUG(verb) ((verb) >= 4)
 
 #define INTERPRETER "python3"
 #define U2F_SCRIPT_PATH "/usr/share/openvpn/pam-u2f/auth-pam-u2f.py"
-
-#define DEBUG(verb) ((verb) >= 4)
+#define U2F_HELPER_TIMEOUT_MS 10000
+#define U2F_CLIENT_REASON_SIZE 4096
 
 /* Command codes for foreground -> background communication */
 #define COMMAND_VERIFY 0
@@ -69,10 +75,16 @@
 #define RESPONSE_INIT_FAILED      11
 #define RESPONSE_VERIFY_SUCCEEDED 12
 #define RESPONSE_VERIFY_FAILED    13
-#define RESPONSE_VERIFY_FAILED_WITH_REASON    14
+#define RESPONSE_DEFER            14
+#define RESPONSE_VERIFY_FAILED_WITH_REASON 15
 
 /* Pointers to functions exported from openvpn */
+static plugin_log_t plugin_log = NULL;
 static plugin_secure_memzero_t plugin_secure_memzero = NULL;
+static plugin_base64_decode_t plugin_base64_decode = NULL;
+
+/* module name for plugin_log() */
+static char *MODULE = "AUTH-PAM-U2F";
 
 /*
  * Plugin state, used by foreground
@@ -96,16 +108,19 @@ struct auth_pam_context
  *  "USERNAME" -- substitute client-supplied username
  *  "PASSWORD" -- substitute client-specified password
  *  "COMMONNAME" -- substitute client certificate common name
+ *  "OTP" -- substitute static challenge response if available
  */
 
 #define N_NAME_VALUE 16
 
-struct name_value {
+struct name_value
+{
     const char *name;
     const char *value;
 };
 
-struct name_value_list {
+struct name_value_list
+{
     int len;
     struct name_value data[N_NAME_VALUE];
 };
@@ -114,20 +129,25 @@ struct name_value_list {
  * Used to pass the username/password
  * to the PAM conversation function.
  */
-struct user_pass {
+struct user_pass
+{
     int verb;
 
     char username[128];
     char password[2048];
     char common_name[128];
-    char script_path[256];
+    char response[128];
+    char remote[INET6_ADDRSTRLEN];
+    char script_path[PATH_MAX];
 
     const struct name_value_list *name_value_list;
 };
 
 /* Background process function */
-static void pam_server(int fd, const char *service, int verb, const struct name_value_list *name_value_list);
-static int u2f_auth_verify(char *username, char* password, char* script_path, char *client_reason);
+static void pam_server(int fd, const char *service, int verb,
+                       const struct name_value_list *name_value_list);
+static int u2f_auth_verify(const struct user_pass *up, const char *password,
+                           char *client_reason, size_t client_reason_len);
 
 
 /*
@@ -153,11 +173,11 @@ recv_control(int fd)
 static int
 send_control(int fd, int code)
 {
-    unsigned char c = (unsigned char) code;
+    unsigned char c = (unsigned char)code;
     const ssize_t size = write(fd, &c, sizeof(c));
     if (size == sizeof(c))
     {
-        return (int) size;
+        return (int)size;
     }
     else
     {
@@ -165,31 +185,30 @@ send_control(int fd, int code)
     }
 }
 
-static int
-recv_string(int fd, char *buffer, int len)
+static ssize_t
+recv_string(int fd, char *buffer, size_t len)
 {
     if (len > 0)
     {
-        ssize_t size;
         memset(buffer, 0, len);
-        size = read(fd, buffer, len);
-        buffer[len-1] = 0;
+        ssize_t size = read(fd, buffer, len);
+        buffer[len - 1] = 0;
         if (size >= 1)
         {
-            return (int)size;
+            return size;
         }
     }
     return -1;
 }
 
-static int
+static ssize_t
 send_string(int fd, const char *string)
 {
-    const int len = strlen(string) + 1;
+    const ssize_t len = strlen(string) + 1;
     const ssize_t size = write(fd, string, len);
     if (size == len)
     {
-        return (int) size;
+        return size;
     }
     else
     {
@@ -218,7 +237,7 @@ daemonize(const char *envp[])
         }
         if (daemon(0, 0) < 0)
         {
-            fprintf(stderr, "AUTH-PAM: daemonization failed\n");
+            plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "daemonization failed");
         }
         else if (fd >= 3)
         {
@@ -287,9 +306,68 @@ name_value_match(const char *query, const char *match)
     return strncasecmp(match, query, strlen(match)) == 0;
 }
 
+/*
+ * Split and decode up->password in the form SCRV1:base64_pass:base64_response
+ * into pass and response and save in up->password and up->response.
+ * If the password is not in the expected format, input is not changed.
+ */
+static void
+split_scrv1_password(struct user_pass *up)
+{
+    const int skip = strlen("SCRV1:");
+    if (strncmp(up->password, "SCRV1:", skip) != 0)
+    {
+        return;
+    }
+
+    char *tmp = strdup(up->password);
+    if (!tmp)
+    {
+        plugin_log(PLOG_ERR, MODULE, "out of memory parsing static challenge password");
+        goto out;
+    }
+
+    char *pass = tmp + skip;
+    char *resp = strchr(pass, ':');
+    if (!resp) /* string not in SCRV1:xx:yy format */
+    {
+        goto out;
+    }
+    *resp++ = '\0';
+
+    int n = plugin_base64_decode(pass, up->password, sizeof(up->password) - 1);
+    if (n >= 0)
+    {
+        up->password[n] = '\0';
+        n = plugin_base64_decode(resp, up->response, sizeof(up->response) - 1);
+        if (n >= 0)
+        {
+            up->response[n] = '\0';
+            if (DEBUG(up->verb))
+            {
+                plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: parsed static challenge password");
+            }
+            goto out;
+        }
+    }
+
+    /* decode error: reinstate original value of up->password and return */
+    plugin_secure_memzero(up->password, sizeof(up->password));
+    plugin_secure_memzero(up->response, sizeof(up->response));
+    strcpy(up->password, tmp); /* tmp is guaranteed to fit in up->password */
+
+    plugin_log(PLOG_ERR, MODULE, "base64 decode error while parsing static challenge password");
+
+out:
+    if (tmp)
+    {
+        plugin_secure_memzero(tmp, strlen(tmp));
+        free(tmp);
+    }
+}
+
 OPENVPN_EXPORT int
-openvpn_plugin_open_v3(const int v3structver,
-                       struct openvpn_plugin_args_open_in const *args,
+openvpn_plugin_open_v3(const int v3structver, struct openvpn_plugin_args_open_in const *args,
                        struct openvpn_plugin_args_open_return *ret)
 {
     pid_t pid;
@@ -303,17 +381,18 @@ openvpn_plugin_open_v3(const int v3structver,
     const char **argv = args->argv;
     const char **envp = args->envp;
 
-    /* Check API compatibility -- struct version 4 or higher needed */
-    if (v3structver < 4)
+    /* Check API compatibility -- struct version 5 or higher needed */
+    if (v3structver < 5)
     {
-        fprintf(stderr, "AUTH-PAM: This plugin is incompatible with the running version of OpenVPN\n");
+        fprintf(stderr,
+                "AUTH-PAM: This plugin is incompatible with the running version of OpenVPN\n");
         return OPENVPN_PLUGIN_FUNC_ERROR;
     }
 
     /*
      * Allocate our context
      */
-    context = (struct auth_pam_context *) calloc(1, sizeof(struct auth_pam_context));
+    context = (struct auth_pam_context *)calloc(1, sizeof(struct auth_pam_context));
     if (!context)
     {
         goto error;
@@ -326,7 +405,9 @@ openvpn_plugin_open_v3(const int v3structver,
     ret->type_mask = OPENVPN_PLUGIN_MASK(OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY);
 
     /* Save global pointers to functions exported from openvpn */
+    plugin_log = args->callbacks->plugin_log;
     plugin_secure_memzero = args->callbacks->plugin_secure_memzero;
+    plugin_base64_decode = args->callbacks->plugin_base64_decode;
 
     /*
      * Make sure we have two string arguments: the first is the .so name,
@@ -334,7 +415,7 @@ openvpn_plugin_open_v3(const int v3structver,
      */
     if (string_array_len(argv) < base_parms)
     {
-        fprintf(stderr, "AUTH-PAM: need PAM service parameter\n");
+        plugin_log(PLOG_ERR, MODULE, "need PAM service parameter");
         goto error;
     }
 
@@ -350,7 +431,7 @@ openvpn_plugin_open_v3(const int v3structver,
 
         if ((nv_len & 1) == 1 || (nv_len / 2) > N_NAME_VALUE)
         {
-            fprintf(stderr, "AUTH-PAM: bad name/value list length\n");
+            plugin_log(PLOG_ERR, MODULE, "bad name/value list length");
             goto error;
         }
 
@@ -359,7 +440,7 @@ openvpn_plugin_open_v3(const int v3structver,
         {
             const int base = base_parms + i * 2;
             name_value_list.data[i].name = argv[base];
-            name_value_list.data[i].value = argv[base+1];
+            name_value_list.data[i].value = argv[base + 1];
         }
     }
 
@@ -380,7 +461,7 @@ openvpn_plugin_open_v3(const int v3structver,
      */
     if (socketpair(PF_UNIX, SOCK_DGRAM, 0, fd) == -1)
     {
-        fprintf(stderr, "AUTH-PAM: socketpair call failed\n");
+        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "socketpair call failed");
         goto error;
     }
 
@@ -390,7 +471,15 @@ openvpn_plugin_open_v3(const int v3structver,
      */
     pid = fork();
 
-    if (pid)
+    if (pid < 0)
+    {
+        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "fork() failed");
+        close(fd[0]);
+        close(fd[1]);
+        goto error;
+    }
+
+    if (pid > 0)
     {
         int status;
 
@@ -406,7 +495,8 @@ openvpn_plugin_open_v3(const int v3structver,
         /* don't let future subprocesses inherit child socket */
         if (fcntl(fd[0], F_SETFD, FD_CLOEXEC) < 0)
         {
-            fprintf(stderr, "AUTH-PAM: Set FD_CLOEXEC flag on socket file descriptor failed\n");
+            plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                       "Set FD_CLOEXEC flag on socket file descriptor failed");
         }
 
         /* wait for background child process to initialize */
@@ -414,9 +504,12 @@ openvpn_plugin_open_v3(const int v3structver,
         if (status == RESPONSE_INIT_SUCCEEDED)
         {
             context->foreground_fd = fd[0];
-            ret->handle = (openvpn_plugin_handle_t *) context;
+            ret->handle = (openvpn_plugin_handle_t *)context;
+            plugin_log(PLOG_NOTE, MODULE, "initialization succeeded (fg)");
             return OPENVPN_PLUGIN_FUNC_SUCCESS;
         }
+        close(fd[0]);
+        waitpid(pid, NULL, 0);
     }
     else
     {
@@ -445,17 +538,57 @@ openvpn_plugin_open_v3(const int v3structver,
     }
 
 error:
-    if (context)
-    {
-        free(context);
-    }
+    free(context);
     return OPENVPN_PLUGIN_FUNC_ERROR;
 }
-OPENVPN_EXPORT int
-openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const char *argv[], const char *envp[], void *per_client_context, struct openvpn_plugin_string_list **return_list)
+
+static void
+free_return_list_entry(struct openvpn_plugin_string_list *entry)
 {
-    char client_reason[4096];
-    struct auth_pam_context *context = (struct auth_pam_context *) handle;
+    if (entry)
+    {
+        free(entry->name);
+        free(entry->value);
+        free(entry);
+    }
+}
+
+static int
+set_client_reason_return(struct openvpn_plugin_string_list **return_list,
+                         const char *client_reason)
+{
+    if (!return_list || !client_reason)
+    {
+        return -1;
+    }
+
+    struct openvpn_plugin_string_list *entry = calloc(1, sizeof(*entry));
+    if (!entry)
+    {
+        return -1;
+    }
+
+    entry->name = strdup("client_reason");
+    entry->value = strdup(client_reason);
+    if (!entry->name || !entry->value)
+    {
+        free_return_list_entry(entry);
+        return -1;
+    }
+
+    entry->next = NULL;
+    *return_list = entry;
+    return 0;
+}
+
+OPENVPN_EXPORT int
+openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const char *argv[],
+                       const char *envp[], void *per_client_context,
+                       struct openvpn_plugin_string_list **return_list)
+{
+    struct auth_pam_context *context = (struct auth_pam_context *)handle;
+    (void)argv;
+    (void)per_client_context;
 
     if (type == OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY && context->foreground_fd >= 0)
     {
@@ -463,7 +596,32 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
         const char *username = get_env("username", envp);
         const char *password = get_env("password", envp);
         const char *common_name = get_env("common_name", envp) ? get_env("common_name", envp) : "";
-        const char *script_path = get_env("u2f_script_path", envp) ? get_env("u2f_script_path", envp) : U2F_SCRIPT_PATH;
+        const char *remote = get_env("untrusted_ip6", envp);
+        const char *script_path = get_env("u2f_script_path", envp) ? get_env("u2f_script_path", envp)
+                                                                   : U2F_SCRIPT_PATH;
+
+        if (remote == NULL)
+        {
+            remote = get_env("untrusted_ip", envp);
+        }
+
+        if (remote == NULL)
+        {
+            remote = "";
+        }
+
+        /*
+         * Upstream auth-pam can defer PAM authentication.  This plugin must
+         * synchronously return a CRV1 client_reason after PAM succeeds, so keep
+         * the U2F flow synchronous even if deferred_auth_pam is present.
+         */
+        if (get_env("auth_control_file", envp) != NULL
+            && get_env("deferred_auth_pam", envp) != NULL
+            && DEBUG(context->verb))
+        {
+            plugin_log(PLOG_NOTE, MODULE,
+                       "deferred PAM auth requested but ignored for synchronous U2F challenge flow");
+        }
 
         if (username && strlen(username) > 0 && password)
         {
@@ -471,9 +629,11 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
                 || send_string(context->foreground_fd, username) == -1
                 || send_string(context->foreground_fd, password) == -1
                 || send_string(context->foreground_fd, common_name) == -1
-                || send_string(context->foreground_fd, script_path) == -1)
+                || send_string(context->foreground_fd, script_path) == -1
+                || send_string(context->foreground_fd, remote) == -1)
             {
-                fprintf(stderr, "AUTH-PAM: Error sending auth info to background process\n");
+                plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                           "Error sending auth info to background process");
             }
             else
             {
@@ -482,18 +642,35 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
                 {
                     return OPENVPN_PLUGIN_FUNC_SUCCESS;
                 }
+                if (status == RESPONSE_DEFER)
+                {
+                    if (DEBUG(context->verb))
+                    {
+                        plugin_log(PLOG_NOTE, MODULE, "deferred authentication");
+                    }
+                    return OPENVPN_PLUGIN_FUNC_DEFERRED;
+                }
                 if (status == -1)
                 {
-                    fprintf(stderr, "AUTH-PAM: Error receiving auth confirmation from background process\n");
-                } else if (status == RESPONSE_VERIFY_FAILED_WITH_REASON) {
-                    //Get a client_reason
-                    if (recv_string(context->foreground_fd, client_reason, sizeof(client_reason)) != -1) {
-                        return_list[0] = malloc(sizeof(struct openvpn_plugin_string_list));
-                        return_list[0]->name = malloc(sizeof(char) * 128);
-                        snprintf(return_list[0]->name, 128, "%s", "client_reason");
-                        return_list[0]->value = malloc(sizeof(char) * 4096);
-                        snprintf(return_list[0]->value, 4096, "%s", client_reason);
-                        return_list[0]->next = NULL;
+                    plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                               "Error receiving auth confirmation from background process");
+                }
+                else if (status == RESPONSE_VERIFY_FAILED_WITH_REASON)
+                {
+                    char client_reason[U2F_CLIENT_REASON_SIZE];
+                    if (recv_string(context->foreground_fd, client_reason,
+                                    sizeof(client_reason)) != -1)
+                    {
+                        if (set_client_reason_return(return_list, client_reason) == -1)
+                        {
+                            plugin_log(PLOG_ERR, MODULE,
+                                       "Error allocating client_reason return value");
+                        }
+                    }
+                    else
+                    {
+                        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                                   "Error receiving client_reason from background process");
                     }
                 }
             }
@@ -505,11 +682,11 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
 OPENVPN_EXPORT void
 openvpn_plugin_close_v1(openvpn_plugin_handle_t handle)
 {
-    struct auth_pam_context *context = (struct auth_pam_context *) handle;
+    struct auth_pam_context *context = (struct auth_pam_context *)handle;
 
     if (DEBUG(context->verb))
     {
-        fprintf(stderr, "AUTH-PAM: close\n");
+        plugin_log(PLOG_NOTE, MODULE, "close");
     }
 
     if (context->foreground_fd >= 0)
@@ -517,7 +694,7 @@ openvpn_plugin_close_v1(openvpn_plugin_handle_t handle)
         /* tell background process to exit */
         if (send_control(context->foreground_fd, COMMAND_EXIT) == -1)
         {
-            fprintf(stderr, "AUTH-PAM: Error signaling background process to exit\n");
+            plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "Error signaling background process to exit");
         }
 
         /* wait for background process to exit */
@@ -536,7 +713,7 @@ openvpn_plugin_close_v1(openvpn_plugin_handle_t handle)
 OPENVPN_EXPORT void
 openvpn_plugin_abort_v1(openvpn_plugin_handle_t handle)
 {
-    struct auth_pam_context *context = (struct auth_pam_context *) handle;
+    struct auth_pam_context *context = (struct auth_pam_context *)handle;
 
     /* tell background process to exit */
     if (context && context->foreground_fd >= 0)
@@ -551,27 +728,26 @@ openvpn_plugin_abort_v1(openvpn_plugin_handle_t handle)
  * PAM conversation function
  */
 static int
-my_conv(int n, const struct pam_message **msg_array,
-        struct pam_response **response_array, void *appdata_ptr)
+my_conv(int num_msg, const struct pam_message **msg_array, struct pam_response **response_array,
+        void *appdata_ptr)
 {
-    const struct user_pass *up = ( const struct user_pass *) appdata_ptr;
+    const struct user_pass *up = (const struct user_pass *)appdata_ptr;
     struct pam_response *aresp;
-    int i;
     int ret = PAM_SUCCESS;
 
     *response_array = NULL;
 
-    if (n <= 0 || n > PAM_MAX_NUM_MSG)
+    if (num_msg <= 0 || num_msg > PAM_MAX_NUM_MSG)
     {
         return (PAM_CONV_ERR);
     }
-    if ((aresp = calloc(n, sizeof *aresp)) == NULL)
+    if ((aresp = calloc((size_t)num_msg, sizeof *aresp)) == NULL)
     {
         return (PAM_BUF_ERR);
     }
 
     /* loop through each PAM-module query */
-    for (i = 0; i < n; ++i)
+    for (int i = 0; i < num_msg; ++i)
     {
         const struct pam_message *msg = msg_array[i];
         aresp[i].resp_retcode = 0;
@@ -579,19 +755,17 @@ my_conv(int n, const struct pam_message **msg_array,
 
         if (DEBUG(up->verb))
         {
-            fprintf(stderr, "AUTH-PAM: BACKGROUND: my_conv[%d] query='%s' style=%d\n",
-                    i,
-                    msg->msg ? msg->msg : "NULL",
-                    msg->msg_style);
+            plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: my_conv[%d] query='%s' style=%d", i,
+                       msg->msg ? msg->msg : "NULL", msg->msg_style);
         }
 
         if (up->name_value_list && up->name_value_list->len > 0)
         {
             /* use name/value list match method */
             const struct name_value_list *list = up->name_value_list;
-            int j;
 
             /* loop through name/value pairs */
+            int j; /* checked after loop */
             for (j = 0; j < list->len; ++j)
             {
                 const char *match_name = list->data[j].name;
@@ -604,10 +778,10 @@ my_conv(int n, const struct pam_message **msg_array,
 
                     if (DEBUG(up->verb))
                     {
-                        fprintf(stderr, "AUTH-PAM: BACKGROUND: name match found, query/match-string ['%s', '%s'] = '%s'\n",
-                                msg->msg,
-                                match_name,
-                                match_value);
+                        plugin_log(
+                            PLOG_NOTE, MODULE,
+                            "BACKGROUND: name match found, query/match-string ['%s', '%s'] = '%s'",
+                            msg->msg, match_name, match_value);
                     }
 
                     if (strstr(match_value, "USERNAME"))
@@ -620,7 +794,12 @@ my_conv(int n, const struct pam_message **msg_array,
                     }
                     else if (strstr(match_value, "COMMONNAME"))
                     {
-                        aresp[i].resp = searchandreplace(match_value, "COMMONNAME", up->common_name);
+                        aresp[i].resp =
+                            searchandreplace(match_value, "COMMONNAME", up->common_name);
+                    }
+                    else if (strstr(match_value, "OTP"))
+                    {
+                        aresp[i].resp = searchandreplace(match_value, "OTP", up->response);
                     }
                     else
                     {
@@ -704,8 +883,16 @@ pam_auth(const char *service, const struct user_pass *up)
     status = pam_start(service, name_value_list_provided ? NULL : up->username, &conv, &pamh);
     if (status == PAM_SUCCESS)
     {
+        /* Set PAM_RHOST environment variable */
+        if (*(up->remote))
+        {
+            status = pam_set_item(pamh, PAM_RHOST, up->remote);
+        }
         /* Call PAM to verify username/password */
-        status = pam_authenticate(pamh, 0);
+        if (status == PAM_SUCCESS)
+        {
+            status = pam_authenticate(pamh, 0);
+        }
         if (status == PAM_SUCCESS)
         {
             status = pam_acct_mgmt(pamh, 0);
@@ -718,9 +905,8 @@ pam_auth(const char *service, const struct user_pass *up)
         /* Output error message if failed */
         if (!ret)
         {
-            fprintf(stderr, "AUTH-PAM: BACKGROUND: user '%s' failed to authenticate: %s\n",
-                    up->username,
-                    pam_strerror(pamh, status));
+            plugin_log(PLOG_ERR, MODULE, "BACKGROUND: user '%s' failed to authenticate: %s",
+                       up->username, pam_strerror(pamh, status));
         }
 
         /* Close PAM */
@@ -747,7 +933,7 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
      */
     if (DEBUG(verb))
     {
-        fprintf(stderr, "AUTH-PAM: BACKGROUND: INIT service='%s'\n", service);
+        plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: INIT service='%s'", service);
     }
 
 #ifdef USE_PAM_DLOPEN
@@ -756,7 +942,8 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
      */
     if (!dlopen_pam(pam_so))
     {
-        fprintf(stderr, "AUTH-PAM: BACKGROUND: could not load PAM lib %s: %s\n", pam_so, dlerror());
+        plugin_log(PLOG_ERR, MODULE, "BACKGROUND: could not load PAM lib %s: %s", pam_so,
+                   dlerror());
         send_control(fd, RESPONSE_INIT_FAILED);
         goto done;
     }
@@ -767,9 +954,11 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
      */
     if (send_control(fd, RESPONSE_INIT_SUCCEEDED) == -1)
     {
-        fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [1]\n");
+        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "BACKGROUND: write error on response socket [1]");
         goto done;
     }
+
+    plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: initialization succeeded");
 
     /*
      * Event loop
@@ -785,7 +974,7 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
 
         if (DEBUG(verb))
         {
-            fprintf(stderr, "AUTH-PAM: BACKGROUND: received command code: %d\n", command);
+            plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: received command code: %d", command);
         }
 
         switch (command)
@@ -794,157 +983,413 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                 if (recv_string(fd, up.username, sizeof(up.username)) == -1
                     || recv_string(fd, up.password, sizeof(up.password)) == -1
                     || recv_string(fd, up.common_name, sizeof(up.common_name)) == -1
-                    || recv_string(fd, up.script_path, sizeof(up.script_path)) == -1)
+                    || recv_string(fd, up.script_path, sizeof(up.script_path)) == -1
+                    || recv_string(fd, up.remote, sizeof(up.remote)) == -1)
                 {
-                    fprintf(stderr, "AUTH-PAM: BACKGROUND: read error on command channel: code=%d, exiting\n",
-                            command);
+                    plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                               "BACKGROUND: read error on command channel: code=%d, exiting",
+                               command);
                     goto done;
                 }
 
                 if (DEBUG(verb))
                 {
 #if 0
-                    fprintf(stderr, "AUTH-PAM: BACKGROUND: USER/PASS: %s/%s\n",
-                            up.username, up.password);
+                    plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: USER/PASS: %s/%s",
+                               up.username, up.password);
 #else
-                    fprintf(stderr, "AUTH-PAM: BACKGROUND: USER: %s\n", up.username);
-                    fprintf(stderr, "AUTH-PAM: BACKGROUND: SCRIPT_PATH: %s\n\n", up.script_path);
+                    plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: USER: %s", up.username);
+                    plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: REMOTE: %s", up.remote);
+                    plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: SCRIPT_PATH: %s", up.script_path);
 #endif
                 }
-                // If the password begins with CRV1 (there's better ways to detect this in case a users 
-                // password *actually* starts with CRV1::), validate it as U2F
-                if (!strncmp("CRV1::", up.password, 6)) {
-                    char client_reason[4096];
-                    int u2f_resp = u2f_auth_verify(up.username, up.password, up.script_path, client_reason);
-                    if (u2f_resp == 0) {
+
+                /* If password is of the form SCRV1:base64:base64 split it up */
+                split_scrv1_password(&up);
+
+                if (!strncmp("CRV1::", up.password, strlen("CRV1::")))
+                {
+                    char client_reason[U2F_CLIENT_REASON_SIZE];
+                    int u2f_resp = u2f_auth_verify(&up, up.password, client_reason,
+                                                   sizeof(client_reason));
+
+                    if (u2f_resp == 0)
+                    {
                         if (send_control(fd, RESPONSE_VERIFY_SUCCEEDED) == -1)
                         {
-                            fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [2]\n");
+                            plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                                       "BACKGROUND: write error on response socket [2]");
                             goto done;
                         }
-                        break;
-                    } else if (u2f_resp == 2) {
-                        if (send_control(fd, RESPONSE_VERIFY_FAILED_WITH_REASON) == -1)
-                        {
-                            fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [3]\n");
-                            goto done;
-                        }
-                        if (send_string(fd, client_reason) == -1) {
-                            fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [4]\n");
-                            goto done;
-                        }
-                        break;
                     }
-                    // If we get an error back from the script, let's attempt to fall through and auth
-                    // against PAM
+                    else if (u2f_resp == 2)
+                    {
+                        if (send_control(fd, RESPONSE_VERIFY_FAILED_WITH_REASON) == -1
+                            || send_string(fd, client_reason) == -1)
+                        {
+                            plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                                       "BACKGROUND: write error on response socket [4]");
+                            goto done;
+                        }
+                    }
+                    else if (send_control(fd, RESPONSE_VERIFY_FAILED) == -1)
+                    {
+                        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                                   "BACKGROUND: write error on response socket [3]");
+                        goto done;
+                    }
+                    break;
                 }
+
+                /* non-deferred auth: wait for pam result and send
+                 * result back via control socketpair
+                 */
                 if (pam_auth(service, &up)) /* Succeeded */
                 {
-                    // Validate via U2F now to get either a challenge or a registration response
-                    char client_reason[4096];
-                    int u2f_resp = u2f_auth_verify(up.username, NULL, up.script_path, client_reason);
-                    if (u2f_resp == 2) {
-                        if (send_control(fd, RESPONSE_VERIFY_FAILED_WITH_REASON) == -1)
+                    char client_reason[U2F_CLIENT_REASON_SIZE];
+                    int u2f_resp = u2f_auth_verify(&up, NULL, client_reason,
+                                                   sizeof(client_reason));
+
+                    if (u2f_resp == 2)
+                    {
+                        if (send_control(fd, RESPONSE_VERIFY_FAILED_WITH_REASON) == -1
+                            || send_string(fd, client_reason) == -1)
                         {
-                            fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [3]\n");
+                            plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                                       "BACKGROUND: write error on response socket [4]");
                             goto done;
                         }
-                        if (send_string(fd, client_reason) == -1) {
-                            fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [4]\n");
-                            goto done;
-                        }
-                    } else {
-                        if (send_control(fd, RESPONSE_VERIFY_FAILED) == -1)
-                        {
-                            fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [3]\n");
-                            goto done;
-                        }
+                    }
+                    else if (send_control(fd, RESPONSE_VERIFY_FAILED) == -1)
+                    {
+                        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                                   "BACKGROUND: write error on response socket [3]");
+                        goto done;
                     }
                 }
                 else /* Failed */
                 {
                     if (send_control(fd, RESPONSE_VERIFY_FAILED) == -1)
                     {
-                        fprintf(stderr, "AUTH-PAM: BACKGROUND: write error on response socket [3]\n");
+                        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                                   "BACKGROUND: write error on response socket [3]");
                         goto done;
                     }
                 }
-                plugin_secure_memzero(up.password, sizeof(up.password));
                 break;
 
             case COMMAND_EXIT:
                 goto done;
 
             case -1:
-                fprintf(stderr, "AUTH-PAM: BACKGROUND: read error on command channel\n");
+                plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                           "BACKGROUND: read error on command channel");
                 goto done;
 
             default:
-                fprintf(stderr, "AUTH-PAM: BACKGROUND: unknown command code: code=%d, exiting\n",
-                        command);
+                plugin_log(PLOG_ERR, MODULE, "BACKGROUND: unknown command code: code=%d, exiting",
+                           command);
                 goto done;
         }
+        plugin_secure_memzero(up.password, sizeof(up.password));
+        plugin_secure_memzero(up.response, sizeof(up.response));
     }
 done:
-
     plugin_secure_memzero(up.password, sizeof(up.password));
+    plugin_secure_memzero(up.response, sizeof(up.response));
 #ifdef USE_PAM_DLOPEN
     dlclose_pam();
 #endif
     if (DEBUG(verb))
     {
-        fprintf(stderr, "AUTH-PAM: BACKGROUND: EXIT\n");
+        plugin_log(PLOG_NOTE, MODULE, "BACKGROUND: EXIT");
     }
 
     return;
 }
-/// Exit Codes:
-/// 0 = Success
-/// 1 = Error
-/// 2 = Return client reason
-static int
-u2f_auth_verify(char *username, char* password, char* script_path, char *client_reason)
-{
-    int retval = 0;
-    int pipefd[2];
-    char buffer[4096];
-    int status, br;
-    int pid;
 
-	char *argv[] = { INTERPRETER, script_path, NULL };
-    pipe(pipefd);
+static int64_t
+monotonic_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+    {
+        return 0;
+    }
+    return ((int64_t)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
+
+static int
+set_nonblocking(int fd)
+{
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1)
+    {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void
+trim_trailing_newlines(char *str)
+{
+    size_t len = strlen(str);
+    while (len > 0 && (str[len - 1] == '\n' || str[len - 1] == '\r'))
+    {
+        str[--len] = '\0';
+    }
+}
+
+static void
+terminate_helper(pid_t pid)
+{
+    int status;
+    struct timespec sleep_time = { .tv_sec = 0, .tv_nsec = 100000000 };
+
+    if (pid <= 0)
+    {
+        return;
+    }
+
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 10; ++i)
+    {
+        pid_t wait_ret = waitpid(pid, &status, WNOHANG);
+        if (wait_ret == pid || (wait_ret == -1 && errno == ECHILD))
+        {
+            return;
+        }
+        nanosleep(&sleep_time, NULL);
+    }
+
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
+    {
+    }
+}
+
+/*
+ * Run the U2F helper.  Exit codes are part of the helper contract:
+ *   0 = U2F verification succeeded
+ *   1 = error or verification failure
+ *   2 = client_reason contains a CRV1 challenge for OpenVPN
+ */
+static int
+u2f_auth_verify(const struct user_pass *up, const char *password,
+                char *client_reason, size_t client_reason_len)
+{
+    int pipefd[2] = { -1, -1 };
+    pid_t pid;
+    int status = 0;
+    size_t used = 0;
+    bool eof = false;
+    bool child_exited = false;
+    bool output_overflow = false;
+
+    if (!up || !client_reason || client_reason_len == 0)
+    {
+        return 1;
+    }
+    client_reason[0] = '\0';
+
+    if (pipe(pipefd) == -1)
+    {
+        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "BACKGROUND: U2F helper pipe() failed");
+        return 1;
+    }
 
     pid = fork();
-    if (pid < 0) {
-        return OPENVPN_PLUGIN_FUNC_ERROR;
-    } else if (pid == 0) {
-        dup2(pipefd[1], STDOUT_FILENO);
+    if (pid < 0)
+    {
+        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "BACKGROUND: U2F helper fork() failed");
         close(pipefd[0]);
         close(pipefd[1]);
+        return 1;
+    }
 
-	    setenv("username", username, 1);
-        if (password != NULL) {
-	        setenv("password", password, 1);
+    if (pid == 0)
+    {
+        char *helper_argv[] = { (char *)INTERPRETER, (char *)up->script_path, NULL };
+
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) == -1)
+        {
+            _exit(1);
         }
-        execvp(argv[0], argv);
-        exit(1);
+        close(pipefd[1]);
+        close_fds_except(-1);
+
+        if (setenv("username", up->username, 1) == -1)
+        {
+            _exit(1);
+        }
+        if (password)
+        {
+            if (setenv("password", password, 1) == -1)
+            {
+                _exit(1);
+            }
+        }
+        else
+        {
+            unsetenv("password");
+        }
+
+        execvp(helper_argv[0], helper_argv);
+        _exit(1);
     }
+
     close(pipefd[1]);
-    while ((br = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
-        buffer[br - 1] = '\0';
+    pipefd[1] = -1;
+
+    if (set_nonblocking(pipefd[0]) == -1)
+    {
+        plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                   "BACKGROUND: U2F helper failed to set pipe nonblocking");
+        terminate_helper(pid);
+        close(pipefd[0]);
+        return 1;
     }
-    wait( &status);
+
+    const int64_t started = monotonic_ms();
+    const int64_t deadline = started + U2F_HELPER_TIMEOUT_MS;
+
+    while (!eof || !child_exited)
+    {
+        char buffer[512];
+        ssize_t br;
+
+        if (!child_exited)
+        {
+            pid_t wait_ret = waitpid(pid, &status, WNOHANG);
+            if (wait_ret == pid)
+            {
+                child_exited = true;
+            }
+            else if (wait_ret == -1)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                           "BACKGROUND: U2F helper waitpid() failed");
+                close(pipefd[0]);
+                return 1;
+            }
+        }
+
+        while (!eof && (br = read(pipefd[0], buffer, sizeof(buffer))) > 0)
+        {
+            if (used < client_reason_len - 1)
+            {
+                size_t available = client_reason_len - 1 - used;
+                size_t to_copy = (size_t)br < available ? (size_t)br : available;
+                memcpy(client_reason + used, buffer, to_copy);
+                used += to_copy;
+                client_reason[used] = '\0';
+                if (to_copy < (size_t)br)
+                {
+                    output_overflow = true;
+                }
+            }
+            else
+            {
+                output_overflow = true;
+            }
+        }
+
+        if (!eof && br == 0)
+        {
+            eof = true;
+        }
+        else if (!eof && br == -1 && errno != EAGAIN && errno != EWOULDBLOCK
+                 && errno != EINTR)
+        {
+            plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                       "BACKGROUND: U2F helper stdout read failed");
+            terminate_helper(pid);
+            close(pipefd[0]);
+            return 1;
+        }
+
+        if (eof && child_exited)
+        {
+            break;
+        }
+
+        int64_t now = monotonic_ms();
+        if (now == 0 || now >= deadline)
+        {
+            plugin_log(PLOG_ERR, MODULE, "BACKGROUND: U2F helper timed out");
+            terminate_helper(pid);
+            close(pipefd[0]);
+            return 1;
+        }
+
+        struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN | POLLHUP };
+        int poll_timeout = (int)(deadline - now);
+        if (poll_timeout > 100)
+        {
+            poll_timeout = 100;
+        }
+        if (!eof)
+        {
+            int poll_ret = poll(&pfd, 1, poll_timeout);
+            if (poll_ret == -1 && errno != EINTR)
+            {
+                plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
+                           "BACKGROUND: U2F helper poll() failed");
+                terminate_helper(pid);
+                close(pipefd[0]);
+                return 1;
+            }
+        }
+        else
+        {
+            struct timespec sleep_time = { .tv_sec = 0, .tv_nsec = 10000000 };
+            nanosleep(&sleep_time, NULL);
+        }
+    }
+
     close(pipefd[0]);
 
-    if (WIFEXITED(status)) {
-        if (client_reason != NULL && WEXITSTATUS(status) == 2) {
-            fprintf(stderr, "AUTH-PAM: BACKGROUND: Got client reason %s\n", buffer);
-            memcpy(client_reason, buffer, sizeof(buffer));
-            fprintf(stderr, "AUTH-PAM: BACKGROUND: Set client reason\n");
-        }
-        return WEXITSTATUS(status);
+    if (output_overflow)
+    {
+        plugin_log(PLOG_ERR, MODULE, "BACKGROUND: U2F helper output exceeded %zu bytes",
+                   client_reason_len - 1);
+        return 1;
     }
-    fprintf(stderr, "AUTH-PAM: BACKGROUND: U2F Script Failed Unexpectedly\n");
-    //Error
-    return OPENVPN_PLUGIN_FUNC_ERROR;
+
+    if (!WIFEXITED(status))
+    {
+        plugin_log(PLOG_ERR, MODULE, "BACKGROUND: U2F helper exited unexpectedly");
+        return 1;
+    }
+
+    const int exit_code = WEXITSTATUS(status);
+    if (exit_code == 2)
+    {
+        trim_trailing_newlines(client_reason);
+        if (client_reason[0] == '\0')
+        {
+            plugin_log(PLOG_ERR, MODULE,
+                       "BACKGROUND: U2F helper requested client_reason with no output");
+            return 1;
+        }
+
+        if (up->verb >= 7)
+        {
+            plugin_log(PLOG_DEBUG, MODULE, "BACKGROUND: U2F helper client_reason: %s",
+                       client_reason);
+        }
+        else
+        {
+            plugin_log(PLOG_NOTE, MODULE,
+                       "BACKGROUND: U2F helper produced client_reason (%zu bytes)",
+                       strlen(client_reason));
+        }
+    }
+
+    return exit_code;
 }
