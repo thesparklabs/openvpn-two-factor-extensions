@@ -70,6 +70,8 @@
 #define OPENVPN_COMMON_NAME_SIZE 128
 #define OPENVPN_REMOTE_SIZE INET6_ADDRSTRLEN
 #define U2F_SCRIPT_PATH_SIZE PATH_MAX
+#define U2F_HELPER_ENV_COUNT 5
+#define U2F_HELPER_ENV_VALUE_SIZE 4096
 
 /* Command codes for foreground -> background communication */
 #define COMMAND_VERIFY 0
@@ -90,6 +92,14 @@ static plugin_base64_decode_t plugin_base64_decode = NULL;
 
 /* module name for plugin_log() */
 static char *MODULE = "AUTH-PAM-U2F";
+
+static const char *helper_env_names[U2F_HELPER_ENV_COUNT] = {
+    "OPENVPN_FIDO_DB_PATH",
+    "OPENVPN_FIDO_APP_ID",
+    "OPENVPN_FIDO_VALID_FACETS",
+    "OPENVPN_FIDO_TRANSACTION_TTL_SECONDS",
+    "OPENVPN_FIDO_MAX_TRANSACTIONS",
+};
 
 /*
  * Plugin state, used by foreground
@@ -144,6 +154,7 @@ struct user_pass
     char response[OPENVPN_USER_PASS_SIZE];
     char remote[OPENVPN_REMOTE_SIZE];
     char script_path[U2F_SCRIPT_PATH_SIZE];
+    char helper_env[U2F_HELPER_ENV_COUNT][U2F_HELPER_ENV_VALUE_SIZE];
 
     const struct name_value_list *name_value_list;
 };
@@ -297,6 +308,64 @@ check_string_limited(const char *string, size_t max_size, const char *label)
                    max_size - 1);
         errno = EMSGSIZE;
         return -1;
+    }
+
+    return 0;
+}
+
+static int
+check_helper_env_limited(const char *values[])
+{
+    for (int i = 0; i < U2F_HELPER_ENV_COUNT; ++i)
+    {
+        if (check_string_limited(values[i], U2F_HELPER_ENV_VALUE_SIZE,
+                                 helper_env_names[i]) == -1)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int
+send_helper_env(int fd, const char *values[])
+{
+    for (int i = 0; i < U2F_HELPER_ENV_COUNT; ++i)
+    {
+        if (send_string(fd, values[i]) == -1)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int
+recv_helper_env(int fd, struct user_pass *up)
+{
+    for (int i = 0; i < U2F_HELPER_ENV_COUNT; ++i)
+    {
+        if (recv_string(fd, up->helper_env[i], sizeof(up->helper_env[i])) == -1)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int
+set_helper_env(const struct user_pass *up)
+{
+    for (int i = 0; i < U2F_HELPER_ENV_COUNT; ++i)
+    {
+        if (up->helper_env[i][0] != '\0'
+            && setenv(helper_env_names[i], up->helper_env[i], 1) == -1)
+        {
+            return -1;
+        }
     }
 
     return 0;
@@ -706,6 +775,7 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
         const char *remote = get_env("untrusted_ip6", envp);
         const char *script_path = get_env("u2f_script_path", envp) ? get_env("u2f_script_path", envp)
                                                                    : U2F_SCRIPT_PATH;
+        const char *helper_env_values[U2F_HELPER_ENV_COUNT];
 
         if (remote == NULL)
         {
@@ -715,6 +785,12 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
         if (remote == NULL)
         {
             remote = "";
+        }
+
+        for (int i = 0; i < U2F_HELPER_ENV_COUNT; ++i)
+        {
+            const char *value = get_env(helper_env_names[i], envp);
+            helper_env_values[i] = value ? value : "";
         }
 
         /*
@@ -738,7 +814,8 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
                                         "common_name") == -1
                 || check_string_limited(script_path, U2F_SCRIPT_PATH_SIZE,
                                         "u2f_script_path") == -1
-                || check_string_limited(remote, OPENVPN_REMOTE_SIZE, "remote") == -1)
+                || check_string_limited(remote, OPENVPN_REMOTE_SIZE, "remote") == -1
+                || check_helper_env_limited(helper_env_values) == -1)
             {
                 plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "Auth info exceeded plugin limits");
             }
@@ -747,7 +824,8 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
                      || send_string(context->foreground_fd, password) == -1
                      || send_string(context->foreground_fd, common_name) == -1
                      || send_string(context->foreground_fd, script_path) == -1
-                     || send_string(context->foreground_fd, remote) == -1)
+                     || send_string(context->foreground_fd, remote) == -1
+                     || send_helper_env(context->foreground_fd, helper_env_values) == -1)
             {
                 plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                            "Error sending auth info to background process");
@@ -1124,7 +1202,8 @@ pam_server(int fd, const char *service, int verb, const struct name_value_list *
                     || recv_string(fd, up.password, sizeof(up.password)) == -1
                     || recv_string(fd, up.common_name, sizeof(up.common_name)) == -1
                     || recv_string(fd, up.script_path, sizeof(up.script_path)) == -1
-                    || recv_string(fd, up.remote, sizeof(up.remote)) == -1)
+                    || recv_string(fd, up.remote, sizeof(up.remote)) == -1
+                    || recv_helper_env(fd, &up) == -1)
                 {
                     plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                                "BACKGROUND: read error on command channel: code=%d, exiting",
@@ -1373,6 +1452,10 @@ u2f_auth_verify(const struct user_pass *up, const char *password,
         else
         {
             unsetenv("password");
+        }
+        if (set_helper_env(up) == -1)
+        {
+            _exit(1);
         }
 
         execvp(helper_argv[0], helper_argv);
