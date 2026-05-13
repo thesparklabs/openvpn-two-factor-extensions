@@ -45,6 +45,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -65,6 +66,10 @@
 #define U2F_SCRIPT_PATH "/usr/share/openvpn/pam-u2f/auth-pam-u2f.py"
 #define U2F_HELPER_TIMEOUT_MS 10000
 #define U2F_CLIENT_REASON_SIZE 4096
+#define OPENVPN_USER_PASS_SIZE 4096
+#define OPENVPN_COMMON_NAME_SIZE 128
+#define OPENVPN_REMOTE_SIZE INET6_ADDRSTRLEN
+#define U2F_SCRIPT_PATH_SIZE PATH_MAX
 
 /* Command codes for foreground -> background communication */
 #define COMMAND_VERIFY 0
@@ -133,12 +138,12 @@ struct user_pass
 {
     int verb;
 
-    char username[128];
-    char password[2048];
-    char common_name[128];
-    char response[128];
-    char remote[INET6_ADDRSTRLEN];
-    char script_path[PATH_MAX];
+    char username[OPENVPN_USER_PASS_SIZE];
+    char password[OPENVPN_USER_PASS_SIZE];
+    char common_name[OPENVPN_COMMON_NAME_SIZE];
+    char response[OPENVPN_USER_PASS_SIZE];
+    char remote[OPENVPN_REMOTE_SIZE];
+    char script_path[U2F_SCRIPT_PATH_SIZE];
 
     const struct name_value_list *name_value_list;
 };
@@ -148,6 +153,7 @@ static void pam_server(int fd, const char *service, int verb,
                        const struct name_value_list *name_value_list);
 static int u2f_auth_verify(const struct user_pass *up, const char *password,
                            char *client_reason, size_t client_reason_len);
+static void terminate_child(pid_t pid);
 
 
 /*
@@ -158,13 +164,24 @@ static int
 recv_control(int fd)
 {
     unsigned char c;
-    const ssize_t size = read(fd, &c, sizeof(c));
+    ssize_t size;
+
+    do
+    {
+        size = read(fd, &c, sizeof(c));
+    }
+    while (size == -1 && errno == EINTR);
+
     if (size == sizeof(c))
     {
         return c;
     }
     else
     {
+        if (size == 0)
+        {
+            errno = EPIPE;
+        }
         /*fprintf (stderr, "AUTH-PAM: DEBUG recv_control.read=%d\n", (int)size);*/
         return -1;
     }
@@ -174,7 +191,14 @@ static int
 send_control(int fd, int code)
 {
     unsigned char c = (unsigned char)code;
-    const ssize_t size = write(fd, &c, sizeof(c));
+    ssize_t size;
+
+    do
+    {
+        size = write(fd, &c, sizeof(c));
+    }
+    while (size == -1 && errno == EINTR);
+
     if (size == sizeof(c))
     {
         return (int)size;
@@ -188,25 +212,67 @@ send_control(int fd, int code)
 static ssize_t
 recv_string(int fd, char *buffer, size_t len)
 {
-    if (len > 0)
+    if (len == 0)
     {
-        memset(buffer, 0, len);
-        ssize_t size = read(fd, buffer, len);
-        buffer[len - 1] = 0;
-        if (size >= 1)
-        {
-            return size;
-        }
+        errno = EINVAL;
+        return -1;
     }
-    return -1;
+
+    memset(buffer, 0, len);
+
+    struct iovec iov = {
+        .iov_base = buffer,
+        .iov_len = len,
+    };
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+    };
+
+    ssize_t size;
+    do
+    {
+        size = recvmsg(fd, &msg, 0);
+    }
+    while (size == -1 && errno == EINTR);
+
+    if (size < 1)
+    {
+        if (size == 0)
+        {
+            errno = EPIPE;
+        }
+        return -1;
+    }
+
+    if (msg.msg_flags & MSG_TRUNC)
+    {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    if (buffer[size - 1] != '\0')
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return size;
 }
 
 static ssize_t
 send_string(int fd, const char *string)
 {
-    const ssize_t len = strlen(string) + 1;
-    const ssize_t size = write(fd, string, len);
-    if (size == len)
+    const size_t len = strlen(string) + 1;
+    ssize_t size;
+
+    do
+    {
+        size = write(fd, string, len);
+    }
+    while (size == -1 && errno == EINTR);
+
+    if (size >= 0 && (size_t)size == len)
     {
         return size;
     }
@@ -214,6 +280,26 @@ send_string(int fd, const char *string)
     {
         return -1;
     }
+}
+
+static int
+check_string_limited(const char *string, size_t max_size, const char *label)
+{
+    if (!string || max_size == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (strnlen(string, max_size) >= max_size)
+    {
+        plugin_log(PLOG_ERR, MODULE, "%s exceeds maximum size %zu", label,
+                   max_size - 1);
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    return 0;
 }
 
 #ifdef DO_DAEMONIZE
@@ -581,6 +667,27 @@ set_client_reason_return(struct openvpn_plugin_string_list **return_list,
     return 0;
 }
 
+static void
+auth_channel_fail(struct auth_pam_context *context)
+{
+    if (!context)
+    {
+        return;
+    }
+
+    if (context->foreground_fd >= 0)
+    {
+        close(context->foreground_fd);
+        context->foreground_fd = -1;
+    }
+
+    if (context->background_pid > 0)
+    {
+        terminate_child(context->background_pid);
+        context->background_pid = -1;
+    }
+}
+
 OPENVPN_EXPORT int
 openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const char *argv[],
                        const char *envp[], void *per_client_context,
@@ -625,15 +732,26 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
 
         if (username && strlen(username) > 0 && password)
         {
-            if (send_control(context->foreground_fd, COMMAND_VERIFY) == -1
-                || send_string(context->foreground_fd, username) == -1
-                || send_string(context->foreground_fd, password) == -1
-                || send_string(context->foreground_fd, common_name) == -1
-                || send_string(context->foreground_fd, script_path) == -1
-                || send_string(context->foreground_fd, remote) == -1)
+            if (check_string_limited(username, OPENVPN_USER_PASS_SIZE, "username") == -1
+                || check_string_limited(password, OPENVPN_USER_PASS_SIZE, "password") == -1
+                || check_string_limited(common_name, OPENVPN_COMMON_NAME_SIZE,
+                                        "common_name") == -1
+                || check_string_limited(script_path, U2F_SCRIPT_PATH_SIZE,
+                                        "u2f_script_path") == -1
+                || check_string_limited(remote, OPENVPN_REMOTE_SIZE, "remote") == -1)
+            {
+                plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "Auth info exceeded plugin limits");
+            }
+            else if (send_control(context->foreground_fd, COMMAND_VERIFY) == -1
+                     || send_string(context->foreground_fd, username) == -1
+                     || send_string(context->foreground_fd, password) == -1
+                     || send_string(context->foreground_fd, common_name) == -1
+                     || send_string(context->foreground_fd, script_path) == -1
+                     || send_string(context->foreground_fd, remote) == -1)
             {
                 plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                            "Error sending auth info to background process");
+                auth_channel_fail(context);
             }
             else
             {
@@ -654,6 +772,7 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
                 {
                     plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                                "Error receiving auth confirmation from background process");
+                    auth_channel_fail(context);
                 }
                 else if (status == RESPONSE_VERIFY_FAILED_WITH_REASON)
                 {
@@ -671,7 +790,14 @@ openvpn_plugin_func_v2(openvpn_plugin_handle_t handle, const int type, const cha
                     {
                         plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                                    "Error receiving client_reason from background process");
+                        auth_channel_fail(context);
                     }
+                }
+                else if (status != RESPONSE_VERIFY_FAILED)
+                {
+                    plugin_log(PLOG_ERR, MODULE,
+                               "Unexpected auth confirmation from background process: %d", status);
+                    auth_channel_fail(context);
                 }
             }
         }
@@ -683,6 +809,7 @@ OPENVPN_EXPORT void
 openvpn_plugin_close_v1(openvpn_plugin_handle_t handle)
 {
     struct auth_pam_context *context = (struct auth_pam_context *)handle;
+    bool exit_signaled = false;
 
     if (DEBUG(context->verb))
     {
@@ -696,15 +823,28 @@ openvpn_plugin_close_v1(openvpn_plugin_handle_t handle)
         {
             plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE, "Error signaling background process to exit");
         }
-
-        /* wait for background process to exit */
-        if (context->background_pid > 0)
+        else
         {
-            waitpid(context->background_pid, NULL, 0);
+            exit_signaled = true;
         }
 
         close(context->foreground_fd);
         context->foreground_fd = -1;
+    }
+
+    if (context->background_pid > 0)
+    {
+        if (exit_signaled)
+        {
+            while (waitpid(context->background_pid, NULL, 0) == -1 && errno == EINTR)
+            {
+            }
+        }
+        else
+        {
+            terminate_child(context->background_pid);
+        }
+        context->background_pid = -1;
     }
 
     free(context);
@@ -1141,7 +1281,7 @@ trim_trailing_newlines(char *str)
 }
 
 static void
-terminate_helper(pid_t pid)
+terminate_child(pid_t pid)
 {
     int status;
     struct timespec sleep_time = { .tv_sec = 0, .tv_nsec = 100000000 };
@@ -1246,7 +1386,7 @@ u2f_auth_verify(const struct user_pass *up, const char *password,
     {
         plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                    "BACKGROUND: U2F helper failed to set pipe nonblocking");
-        terminate_helper(pid);
+        terminate_child(pid);
         close(pipefd[0]);
         return 1;
     }
@@ -1308,7 +1448,7 @@ u2f_auth_verify(const struct user_pass *up, const char *password,
         {
             plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                        "BACKGROUND: U2F helper stdout read failed");
-            terminate_helper(pid);
+            terminate_child(pid);
             close(pipefd[0]);
             return 1;
         }
@@ -1322,7 +1462,7 @@ u2f_auth_verify(const struct user_pass *up, const char *password,
         if (now == 0 || now >= deadline)
         {
             plugin_log(PLOG_ERR, MODULE, "BACKGROUND: U2F helper timed out");
-            terminate_helper(pid);
+            terminate_child(pid);
             close(pipefd[0]);
             return 1;
         }
@@ -1340,7 +1480,7 @@ u2f_auth_verify(const struct user_pass *up, const char *password,
             {
                 plugin_log(PLOG_ERR | PLOG_ERRNO, MODULE,
                            "BACKGROUND: U2F helper poll() failed");
-                terminate_helper(pid);
+                terminate_child(pid);
                 close(pipefd[0]);
                 return 1;
             }
