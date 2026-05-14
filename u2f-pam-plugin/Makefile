@@ -7,10 +7,10 @@ OBJS = auth-pam-u2f.o pamdl.o utils.o
 all: auth-pam-u2f.so
 
 auth-pam-u2f.o: auth-pam-u2f.c
-	$(CC) $(CFLAGS) $(LD_LIB_PATH) -fPIC -c auth-pam-u2f.c utils.c pamdl.c pamdl.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LD_LIB_PATH) -fPIC -c auth-pam-u2f.c utils.c pamdl.c
 
 auth-pam-u2f.so: auth-pam-u2f.o pamdl.o utils.o
-	$(CC) -fPIC -shared -o auth-pam-u2f.so $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -fPIC -shared -o auth-pam-u2f.so $(OBJS)
 
 install: auth-pam-u2f.so
 	mkdir -p $(DESTDIR)$(PREFIX)
