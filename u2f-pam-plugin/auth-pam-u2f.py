@@ -43,8 +43,10 @@ else:
 
 
 DEFAULT_CLIENT_NAME = "openvpn"
-DEFAULT_DB_PATH = "/var/lib/u2fval/u2fval.db"
-U2FVAL_CONFIG_PATH = "/etc/yubico/u2fval/u2fval.conf"
+DEFAULT_DB_PATH = "/var/lib/openvpn-u2f-plugin/u2f.db"
+LEGACY_U2FVAL_DB_PATH = "/etc/yubico/u2fval/u2fval.db"
+DB_DIR_MODE = 0o700
+DB_FILE_MODE = 0o600
 TRANSACTION_TTL_SECONDS = 300
 MAX_TRANSACTIONS_PER_USER = 5
 MAX_CRV1_RESPONSE_JSON_BYTES = 16 * 1024
@@ -53,23 +55,18 @@ MAX_CRV1_RESPONSE_JSON_BYTES = 16 * 1024
 class U2FError(Exception):
     pass
 
-
 def error(message):
     print(message, file=sys.stderr)
-
 
 def require_fido2():
     if FIDO2_IMPORT_ERROR is not None:
         raise U2FError("python-fido2 is required: %s" % FIDO2_IMPORT_ERROR)
 
-
 def utcnow():
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
-
 def utcnow_string():
     return utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
-
 
 def parse_timestamp(value):
     if not value:
@@ -84,16 +81,28 @@ def parse_timestamp(value):
     except ValueError:
         return None
 
-
 def base64encode_text(value):
     return base64.b64encode(value.encode("utf-8")).decode("ascii")
-
 
 def crv1_response(prefix, username, payload):
     encoded_user = base64encode_text(username)
     encoded_payload = base64encode_text(json.dumps(payload, separators=(",", ":")))
     return "%s:%s:%s" % (prefix, encoded_user, encoded_payload)
 
+def default_db_path():
+    if os.path.exists(LEGACY_U2FVAL_DB_PATH):
+        return LEGACY_U2FVAL_DB_PATH
+    return DEFAULT_DB_PATH
+
+def chmod_if_exists(path, mode):
+    try:
+        os.chmod(path, mode)
+    except FileNotFoundError:
+        pass
+
+def restrict_database_permissions(db_path, suffixes):
+    for suffix in suffixes:
+        chmod_if_exists(db_path + suffix, DB_FILE_MODE)
 
 def bounded_gzip_decompress(token):
     decompressor = zlib.decompressobj(47)
@@ -115,7 +124,6 @@ def bounded_gzip_decompress(token):
         raise U2FError("U2F response is too large")
 
     return token
-
 
 def decode_crv1_password(password):
     if not password.startswith("CRV1:"):
@@ -147,7 +155,6 @@ def decode_crv1_password(password):
 
     return mode, response
 
-
 def decode_websafe(value, field_name):
     if not isinstance(value, str):
         raise U2FError("Missing or invalid %s" % field_name)
@@ -155,7 +162,6 @@ def decode_websafe(value, field_name):
         return websafe_decode(value)
     except Exception as exc:
         raise U2FError("Invalid %s encoding" % field_name) from exc
-
 
 def parse_client_data(response, expected_type):
     raw = decode_websafe(response.get("clientData"), "clientData")
@@ -173,14 +179,12 @@ def parse_client_data(response, expected_type):
 
     return raw, data
 
-
 def normalize_origin(value):
     if not isinstance(value, str):
         return ""
     if value.endswith("/"):
         return value[:-1]
     return value
-
 
 def parse_facets(value, app_id):
     facets = []
@@ -196,21 +200,17 @@ def parse_facets(value, app_id):
         facets.append(app_id)
     return facets
 
-
 def verify_origin(origin, facets):
     normalized_origin = normalize_origin(origin)
     normalized_facets = {normalize_origin(facet) for facet in facets}
     if normalized_origin not in normalized_facets:
         raise U2FError("U2F response origin is not trusted")
 
-
 def transaction_id_for_challenge(challenge):
     return hashlib.sha256(challenge.encode("utf-8")).hexdigest()
 
-
 def random_challenge():
     return websafe_encode(secrets.token_bytes(32))
-
 
 def is_truthy(value):
     if value is None:
@@ -219,10 +219,9 @@ def is_truthy(value):
         return value != 0
     return str(value).lower() in ("1", "true", "yes")
 
-
 class U2FStore:
     def __init__(self, db_path=None, app_id=None, valid_facets=None):
-        self.db_path = db_path or os.environ.get("OPENVPN_FIDO_DB_PATH", DEFAULT_DB_PATH)
+        self.db_path = db_path or os.environ.get("OPENVPN_FIDO_DB_PATH") or default_db_path()
         self.client_name = DEFAULT_CLIENT_NAME
         self.app_id = app_id or os.environ.get("OPENVPN_FIDO_APP_ID")
         self.valid_facets = valid_facets or os.environ.get("OPENVPN_FIDO_VALID_FACETS")
@@ -236,16 +235,19 @@ class U2FStore:
     def connect(self):
         if not os.path.exists(self.db_path) and not self.app_id:
             message = "No existing U2F database found at %s" % self.db_path
-            if os.path.exists(U2FVAL_CONFIG_PATH):
-                message += " for the detected u2fval installation"
             message += "; set OPENVPN_FIDO_APP_ID to initialize a new database"
             raise U2FError(message)
 
         parent = os.path.dirname(self.db_path)
         if parent and not os.path.exists(parent):
-            os.makedirs(parent, mode=0o700, exist_ok=True)
+            os.makedirs(parent, mode=DB_DIR_MODE, exist_ok=True)
+            os.chmod(parent, DB_DIR_MODE)
 
+        db_existed = os.path.exists(self.db_path)
         conn = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
+        if not db_existed:
+            restrict_database_permissions(self.db_path, ("",))
+
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -253,6 +255,8 @@ class U2FStore:
             conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.DatabaseError:
             pass
+        if not db_existed:
+            restrict_database_permissions(self.db_path, ("-wal", "-shm"))
         return conn
 
     @contextlib.contextmanager
@@ -553,7 +557,6 @@ class U2FStore:
                 "transactions": tx_cursor.rowcount,
             }
 
-
 class OpenVPNU2FAuthPlugin:
     def __init__(self):
         require_fido2()
@@ -759,7 +762,6 @@ class OpenVPNU2FAuthPlugin:
                 self.store.mark_compromised(conn, device["id"])
                 raise U2FError("U2F device counter did not increase")
 
-
 def main():
     try:
         if len(sys.argv) > 1:
@@ -770,7 +772,6 @@ def main():
     except Exception as exc:
         error("Unexpected U2F authentication error: %s" % exc)
     return 1
-
 
 def run_admin_command(argv):
     parser = argparse.ArgumentParser(
@@ -783,7 +784,7 @@ def run_admin_command(argv):
     )
     reset_parser.add_argument(
         "--db",
-        default=os.environ.get("OPENVPN_FIDO_DB_PATH", DEFAULT_DB_PATH),
+        default=os.environ.get("OPENVPN_FIDO_DB_PATH") or default_db_path(),
         help="Path to the U2F SQLite database",
     )
     reset_parser.add_argument("username", help="Username to reset")
@@ -802,7 +803,6 @@ def run_admin_command(argv):
 
     parser.error("Unknown command")
     return 2
-
 
 if __name__ == "__main__":
     sys.exit(main())
